@@ -76,6 +76,7 @@ class MaskedAutoencoderViT(nn.Module):
         # --------------------------------------------------------------------------
 
         self.norm_pix_loss = norm_pix_loss
+        self.mse_loss = nn.MSELoss(reduction='sum')
 
         self.initialize_weights()
 
@@ -118,9 +119,9 @@ class MaskedAutoencoderViT(nn.Module):
         assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0
 
         h = w = imgs.shape[2] // p
-        x = imgs.reshape(shape=(imgs.shape[0], 3, h, p, w, p))
+        x = imgs.reshape(imgs.shape[0], 3, h, p, w, p)
         x = torch.einsum('nchpwq->nhwpqc', x)
-        x = x.reshape(shape=(imgs.shape[0], h * w, p**2 * 3))
+        x = x.reshape(imgs.shape[0], h * w, p**2 * 3)
         return x
 
     def unpatchify(self, x):
@@ -152,6 +153,37 @@ class MaskedAutoencoderViT(nn.Module):
         mask = torch.gather(mask, dim=1, index=ids_restore)
         return ids_keep, mask
 
+    def embeddings_gatherings(self, x, ids_keep, stage1_embed, stage2_embed):
+        """
+        x: [N, L, D], sequence
+        ids_keep: [N, 4, L_keep]
+        """
+        def quadruple_batch(t):
+            # [N, L, D] -> [N, 4, L, D]
+            return t.unsqueeze(1).expand(t.shape[0], 4, t.shape[1], t.shape[2])
+
+        def merge_quadrupled_batch(t):
+            return t.reshape([-1, t.shape[2], t.shape[3]])
+
+        x = quadruple_batch(x)
+        stage1_embed = quadruple_batch(stage1_embed)
+        stage2_embed = quadruple_batch(stage2_embed)
+
+        x = torch.gather(x, dim=2, index=ids_keep.unsqueeze(-1).expand([-1, -1, -1, x.shape[-1]]))
+        stage1_embed = torch.gather(stage1_embed, dim=2, index=ids_keep.unsqueeze(-1).expand([-1, -1, -1, stage1_embed.shape[-1]]))
+        stage2_embed = torch.gather(stage2_embed, dim=2, index=ids_keep.unsqueeze(-1).expand([-1, -1, -1, stage2_embed.shape[-1]]))
+
+        assert x.is_contiguous()
+        assert stage1_embed.is_contiguous()
+        assert stage2_embed.is_contiguous()
+
+        # [N, 4, L, D] -> [N * 4, L, D]
+        x = merge_quadrupled_batch(x)
+        stage1_embed = merge_quadrupled_batch(stage1_embed)
+        stage2_embed = merge_quadrupled_batch(stage2_embed)
+
+        return x, stage1_embed, stage2_embed
+
     def embeddings_gathering(self, x, ids_keep, stage1_embed, stage2_embed):
         """
         Perform complementary masked embeddings gathering from stage 1 & 2
@@ -176,24 +208,32 @@ class MaskedAutoencoderViT(nn.Module):
         len_keep = int(L * (1 - mask_ratio))
 
         noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
-        
+
         # sort noise for each sample
         ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
         ids_restore = torch.argsort(ids_shuffle, dim=1)
         
         # complementary masks splitting
-        ids_keep1, mask1 = self.masks_splitting(ids_restore, ids_shuffle, 0, len_keep)
-        ids_keep2, mask2 = self.masks_splitting(ids_restore, ids_shuffle, len_keep, 2*len_keep)
-        ids_keep3, mask3 = self.masks_splitting(ids_restore, ids_shuffle, 2*len_keep, 3*len_keep)
-        ids_keep4, mask4 = self.masks_splitting(ids_restore, ids_shuffle, 3*len_keep, L)
+        assert L % 4 == 0
+        assert mask_ratio == 0.75
+        ids_keep = ids_shuffle.reshape(N, 4, L // 4)
 
-        return [ids_keep1, ids_keep2, ids_keep3, ids_keep4], [mask1, mask2, mask3, mask4], ids_restore
+        mask = torch.ones([N, 4, L], device=ids_restore.device)
+        mask[:, 0, 0:len_keep] = 0
+        mask[:, 1, len_keep:2*len_keep] = 0
+        mask[:, 2, 2*len_keep:3*len_keep] = 0
+        mask[:, 3, 3*len_keep:L] = 0
+
+        # unshuffle to get the binary mask
+        mask = torch.gather(mask, dim=2, index=ids_restore.unsqueeze(1).expand(-1, 4, -1))
+
+        return ids_keep, mask, ids_restore
 
     def forward_encoder(self, x, mask_ratio):
         # embed patches
-        ids_keep, masks, ids_restore = self.random_masking(x, mask_ratio)
-        mask_for_patch1 = [1 - mask.reshape(-1, 14, 14).unsqueeze(-1).repeat(1, 1, 1, 16).reshape(-1, 14, 14, 4, 4).permute(0, 1, 3, 2, 4).reshape(x.shape[0], 56, 56).unsqueeze(1) for mask in masks]
-        mask_for_patch2 = [1 - mask.reshape(-1, 14, 14).unsqueeze(-1).repeat(1, 1, 1, 4).reshape(-1, 14, 14, 2, 2).permute(0, 1, 3, 2, 4).reshape(x.shape[0], 28, 28).unsqueeze(1) for mask in masks]
+        ids_keep, mask, ids_restore = self.random_masking(x, mask_ratio)
+        mask_for_patch1 = [1 - mask[:, i].reshape(-1, 14, 14).unsqueeze(-1).expand(-1, -1, -1, 16).reshape(-1, 14, 14, 4, 4).permute(0, 1, 3, 2, 4).reshape(x.shape[0], 56, 56).unsqueeze(1) for i in range(0, 4)]
+        mask_for_patch2 = [1 - mask[:, i].reshape(-1, 14, 14).unsqueeze(-1).expand(-1, -1, -1, 4).reshape(-1, 14, 14, 2, 2).permute(0, 1, 3, 2, 4).reshape(x.shape[0], 28, 28).unsqueeze(1) for i in range(0, 4)]
         x = self.patch_embed1(x)
         for blk in self.blocks1:
             x = blk(x, mask_for_patch1)
@@ -209,19 +249,12 @@ class MaskedAutoencoderViT(nn.Module):
         # add pos embed w/o cls token
         x = x + self.pos_embed
         # gather embeddigns for each mask
-        x1, stage1_embed_1, stage2_embed_1 = self.embeddings_gathering(x, ids_keep[0], stage1_embed, stage2_embed)
-        x2, stage1_embed_2, stage2_embed_2 = self.embeddings_gathering(x, ids_keep[1], stage1_embed, stage2_embed)
-        x3, stage1_embed_3, stage2_embed_3 = self.embeddings_gathering(x, ids_keep[2], stage1_embed, stage2_embed)
-        x4, stage1_embed_4, stage2_embed_4 = self.embeddings_gathering(x, ids_keep[3], stage1_embed, stage2_embed)
-        x = torch.cat([x1, x2, x3, x4])
-        stage1_embed = torch.cat([stage1_embed_1, stage1_embed_2, stage1_embed_3, stage1_embed_4])
-        stage2_embed = torch.cat([stage2_embed_1, stage2_embed_2, stage2_embed_3, stage2_embed_4])
+        x, stage1_embed, stage2_embed = self.embeddings_gatherings(x, ids_keep, stage1_embed, stage2_embed)
         # apply Transformer blocks
         for blk in self.blocks3:
             x = blk(x)
         x = x + stage1_embed + stage2_embed
         x = self.norm(x)
-        mask = torch.cat([masks[i] for i in range(len(masks))])
         return x, mask, ids_restore
 
     def forward_decoder(self, x, ids_restore):
@@ -229,18 +262,21 @@ class MaskedAutoencoderViT(nn.Module):
         x = self.decoder_embed(x)
 
         # append mask tokens to sequence
-        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1]  - x.shape[1], 1)
+        mask_tokens = self.mask_token.expand(x.shape[0], ids_restore.shape[1]  - x.shape[1], self.mask_token.shape[2])
         x_ = torch.cat([x, mask_tokens], dim=1)  # no cls token
 
         # split decoder embeddings for each complementary mask
         B = x_.shape[0]
-        x_split1 = x_[: B // 4, :, :]
-        x_split2 = torch.roll(x_[B // 4 : B // 4 * 2, : , :], 49, 1)
-        x_split3 = torch.roll(x_[B // 4 * 2 : B // 4 * 3, : ,:], 49 * 2, 1)
-        x_split4 = torch.roll(x_[B // 4 * 3 :, : ,:], 49 * 3, 1)
-        x_ = torch.cat([x_split1, x_split2, x_split3, x_split4])
-        ids_restore = ids_restore.repeat(4,1)
-        x = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
+        x_ = x_.reshape([B // 4, 4, x_.shape[1], x.shape[2]])
+        x_[:, 1] = x_[:, 1].roll(49 * 1, 1)
+        x_[:, 2] = x_[:, 2].roll(49 * 2, 1)
+        x_[:, 3] = x_[:, 3].roll(49 * 3, 1)
+
+        ids_restore = ids_restore.unsqueeze(1).unsqueeze(-1).expand([-1, 4, -1, x.shape[2]])
+
+        x = torch.gather(x_, dim=2, index=ids_restore)  # unshuffle
+
+        x = x.reshape([B, x.shape[2], x.shape[3]])
 
         # add pos embed
         x = x + self.decoder_pos_embed
@@ -266,11 +302,18 @@ class MaskedAutoencoderViT(nn.Module):
             mean = target.mean(dim=-1, keepdim=True)
             var = target.var(dim=-1, keepdim=True)
             target = (target - mean) / (var + 1.e-6)**.5
-        target = target.repeat(4, 1, 1)
-        loss = (pred - target) ** 2
-        loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
 
-        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
+        target = target.unsqueeze(1).expand([-1, 4, -1, -1])
+        #mask = mask.reshape([mask.shape[0] // 4, 4, mask.shape[1]])
+        pred = pred.reshape([pred.shape[0] // 4, 4, pred.shape[1], pred.shape[2]])
+
+        mask_bool = (mask == 0)
+        pred = torch.where(mask_bool.unsqueeze(-1).expand(-1, -1, -1, target.size(3)), target, pred.float())
+
+        loss = self.mse_loss(pred, target)
+        loss /= target.size(3)
+        loss /= mask.sum()
+
         return loss
 
     def forward(self, imgs, mask_ratio=0.75):

@@ -20,6 +20,59 @@ import torch
 import torch.distributed as dist
 from torch._six import inf
 
+class SmoothedTensorValue(object):
+    """Track a series of values and provide access to smoothed values over a
+    window or the global series average.
+    """
+
+    def __init__(self, window_size=20, fmt=None):
+        if fmt is None:
+            fmt = "{median:.4f} ({global_avg:.4f})"
+        self.deque = deque(maxlen=window_size)
+        self.total = 0.0
+        self.count = 0
+        self.fmt = fmt
+
+    def update(self, value, n=1):
+        if isinstance(value, (float, int)):
+            value = torch.tensor([value])
+        self.deque.append(value)
+        self.count += n
+        self.total += value * n
+
+    def synchronize_between_processes(self):
+        # no sync needed
+        pass
+
+    @property
+    def median(self):
+        d = torch.stack(list(self.deque))
+        return d.median().item()
+
+    @property
+    def avg(self):
+        d = torch.stack(list(self.deque))
+        return d.mean().item()
+
+    @property
+    def global_avg(self):
+        return (self.total / self.count).item()
+
+    @property
+    def max(self):
+        return max(self.deque).item()
+
+    @property
+    def value(self):
+        return self.deque[-1].item()
+
+    def __str__(self):
+        return self.fmt.format(
+            median=self.median,
+            avg=self.avg,
+            global_avg=self.global_avg,
+            max=self.max,
+            value=self.value)
 
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
@@ -85,17 +138,23 @@ class SmoothedValue(object):
 
 class MetricLogger(object):
     def __init__(self, delimiter="\t"):
-        self.meters = defaultdict(SmoothedValue)
+        self.meters = defaultdict(SmoothedTensorValue)
         self.delimiter = delimiter
 
     def update(self, **kwargs):
         for k, v in kwargs.items():
             if v is None:
                 continue
-            if isinstance(v, torch.Tensor):
-                v = v.item()
-            assert isinstance(v, (float, int))
+            if isinstance(self.meters[k], SmoothedTensorValue):
+                if isinstance(v, (float, int)):
+                    v = torch.tensor([v])
+                assert isinstance(v, torch.Tensor)
+            else:
+                if isinstance(v, torch.Tensor):
+                    v = v.item()
+                assert isinstance(v, (float, int))
             self.meters[k].update(v)
+
 
     def __getattr__(self, attr):
         if attr in self.meters:
@@ -296,7 +355,27 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
     output_dir = Path(args.output_dir)
     epoch_name = str(epoch)
     if loss_scaler is not None:
-        checkpoint_paths = [output_dir / ('checkpoint-%s.pth' % epoch_name)]
+        checkpoint_paths = [output_dir / 'checkpoint.pth']
+        for checkpoint_path in checkpoint_paths:
+            to_save = {
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch,
+                'scaler': loss_scaler.state_dict(),
+                'args': args,
+            }
+
+            save_on_master(to_save, checkpoint_path)
+    else:
+        client_state = {'epoch': epoch}
+        model.save_checkpoint(save_dir=args.output_dir, tag="checkpoint-%s" % epoch_name, client_state=client_state)
+
+
+def save_best_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
+    output_dir = Path(args.output_dir)
+    epoch_name = str(epoch)
+    if loss_scaler is not None:
+        checkpoint_paths = [output_dir / 'best_checkpoint.pth']
         for checkpoint_path in checkpoint_paths:
             to_save = {
                 'model': model_without_ddp.state_dict(),

@@ -1,0 +1,11 @@
+python -u main_pretrain.py \
+    --batch_size 512 \
+    --epochs 1000 \
+    --model fastconvmae_convvit_base_patch16 \
+    --norm_pix_loss \
+    --mask_ratio 0.75 \
+    --warmup_epochs 10 \
+    --pin_mem \
+    --blr 6.0e-4 \
+    --weight_decay 0.05 \
+    --data_path /new_home/share/dataset/mlperf/training/image/resnet

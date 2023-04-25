@@ -24,7 +24,7 @@ import torchvision.datasets as datasets
 
 import timm
 
-assert timm.__version__ == "0.3.2"  # version check
+# assert timm.__version__ == "0.3.2"  # version check
 import timm.optim.optim_factory as optim_factory
 
 import util.misc as misc
@@ -39,12 +39,12 @@ def get_args_parser():
     parser = argparse.ArgumentParser('MAE pre-training', add_help=False)
     parser.add_argument('--batch_size', default=64, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--epochs', default=400, type=int)
+    parser.add_argument('--epochs', default=10, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
     # Model parameters
-    parser.add_argument('--model', default='mae_vit_large_patch16', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='fastconvmae_convvit_base_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
 
     parser.add_argument('--input_size', default=224, type=int,
@@ -72,7 +72,7 @@ def get_args_parser():
                         help='epochs to warmup LR')
 
     # Dataset parameters
-    parser.add_argument('--data_path', default='/datasets01/imagenet_full_size/061417/', type=str,
+    parser.add_argument('--data_path', default='/nas/common_data/imagenet_tiny', type=str,
                         help='dataset path')
 
     parser.add_argument('--output_dir', default='./output_dir',
@@ -124,7 +124,9 @@ def main(args):
             transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.ConvertImageDtype(torch.bfloat16)
+            ])
     dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
     print(dataset_train)
 
@@ -153,7 +155,7 @@ def main(args):
     )
     
     # define the model
-    model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
+    model = models_fastconvmae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
 
     model.to(device)
 
@@ -186,7 +188,7 @@ def main(args):
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
+        if True:
             data_loader_train.sampler.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, data_loader_train,
@@ -214,6 +216,15 @@ def main(args):
 
 
 if __name__ == '__main__':
+
+    # Invoke graph execution before set_backend_config
+    a = torch.randn(3).cuda()
+    (a * 3).cpu()
+
+    from moreh.driver.common.config import set_backend_config, set_config
+    set_backend_config('miopen_mode', 3)
+    set_config('autocast_lower_precision_dtype', 'bf16')
+
     args = get_args_parser()
     args = args.parse_args()
     if args.output_dir:
