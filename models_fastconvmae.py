@@ -19,6 +19,16 @@ from vision_transformer import PatchEmbed, Block, CBlock
 
 from util.pos_embed import get_2d_sincos_pos_embed
 
+from torch.nn import functional as F
+
+class LayerNormFp32(nn.LayerNorm):
+    """Subclass torch's LayerNorm to handle fp16 (by casting to float32 and back)."""
+
+    def forward(self, x: torch.Tensor):
+        orig_type = x.dtype
+        x = F.layer_norm(x.to(torch.float32), self.normalized_shape, self.weight, self.bias, self.eps)
+        return x.to(orig_type)
+
 
 class MaskedAutoencoderViT(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
@@ -329,5 +339,15 @@ def fastconvmae_convvit_base_patch16_dec512d8b(**kwargs):
         mlp_ratio=[4, 4, 4], norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
+def fastconvmae_convvit_small_patch16_dec512d8b(**kwargs):
+    model = MaskedAutoencoderViT(
+        img_size=[224, 56, 28], patch_size=[4, 2, 2], embed_dim=[128, 256, 384], depth=[2, 2, 11], num_heads=6,
+        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
+        mlp_ratio=[4, 4, 4],
+        norm_layer=partial(LayerNormFp32, eps=1e-6),
+        **kwargs)
+    return model
+
 # set recommended archs
 fastconvmae_convvit_base_patch16 = fastconvmae_convvit_base_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
+fastconvmae_convvit_small_patch16 = fastconvmae_convvit_small_patch16_dec512d8b
