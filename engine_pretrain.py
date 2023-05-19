@@ -61,7 +61,7 @@ def train_one_epoch(model: torch.nn.Module,
             # if max_norm is not None:
             #     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             optimizer.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
         torch.cuda.synchronize()
 
