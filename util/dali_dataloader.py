@@ -101,7 +101,7 @@ def create_dali_pipeline(data_dir, crop, shard_id, num_shards, dali_cpu=True, is
                                                preallocate_height_hint=preallocate_height_hint,
                                                random_aspect_ratio=[0.8, 1.25],
                                                random_area=[0.1, 1.0],
-                                               num_attempts=100)
+                                               num_attempts=5)
         images = fn.resize(images,
                            device=dali_device,
                            resize_x=crop,
@@ -122,102 +122,14 @@ def create_dali_pipeline(data_dir, crop, shard_id, num_shards, dali_cpu=True, is
     images = fn.crop_mirror_normalize(images,#.gpu(),
                                       dtype=types.FLOAT,
                                       output_layout="CHW",
-                                      crop=(crop, crop),
+                                      # crop=(crop, crop),
                                       mean=[0.485 * 255,0.456 * 255,0.406 * 255],
                                       std=[0.229 * 255,0.224 * 255,0.225 * 255],
                                       mirror=mirror)
-    labels = labels#.gpu()
+
     return images, labels
 
 
-def main():
-    
-
-    args.gpu = 0
-    args.world_size = 1
 
 
 
-
-
-
-
-
-    # Data loading code
-    if len(args.data) == 1:
-        traindir = os.path.join(args.data[0], 'train')
-        valdir = os.path.join(args.data[0], 'val')
-    else:
-        traindir = args.data[0]
-        valdir= args.data[1]
-
-    crop_size = 224
-    val_size = 256
-
-    train_loader = None
-    val_loader = None
-    if not args.disable_dali:
-        train_pipe = create_dali_pipeline(batch_size=args.batch_size,
-                                          num_threads=args.workers,
-                                          device_id=args.local_rank,
-                                          seed=12 + args.local_rank,
-                                          data_dir=traindir,
-                                          crop=crop_size,
-                                          size=val_size,
-                                          dali_cpu=True,
-                                          shard_id=args.local_rank,
-                                          num_shards=args.world_size,
-                                          is_training=True)
-        train_pipe.build()
-        train_loader = DALIClassificationIterator(train_pipe, reader_name="Reader",
-                                                  last_batch_policy=LastBatchPolicy.PARTIAL,
-                                                  auto_reset=True)
-
-
-
-class data_prefetcher():
-    """Based on prefetcher from the APEX example
-       https://github.com/NVIDIA/apex/blob/5b5d41034b506591a316c308c3d2cd14d5187e23/examples/imagenet/main_amp.py#L265
-    """
-    def __init__(self, loader):
-        self.loader = iter(loader)
-        self.stream = torch.cuda.Stream()
-        self.mean = torch.tensor([0.485 * 255, 0.456 * 255, 0.406 * 255]).cuda().view(1,3,1,1)
-        self.std = torch.tensor([0.229 * 255, 0.224 * 255, 0.225 * 255]).cuda().view(1,3,1,1)
-        self.preload()
-
-    def preload(self):
-        try:
-            self.next_input, self.next_target = next(self.loader)
-        except StopIteration:
-            self.next_input = None
-            self.next_target = None
-            return
-        with torch.cuda.stream(self.stream):
-            self.next_input = self.next_input.cuda(non_blocking=True)
-            self.next_target = self.next_target.cuda(non_blocking=True)
-            self.next_input = self.next_input.float()
-            self.next_input = self.next_input.sub_(self.mean).div_(self.std)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        """The iterator was added on top of the orignal example to align it with DALI iterator
-        """
-        torch.cuda.current_stream().wait_stream(self.stream)
-        input = self.next_input
-        target = self.next_target
-        if input is not None:
-            input.record_stream(torch.cuda.current_stream())
-        if target is not None:
-            target.record_stream(torch.cuda.current_stream())
-        self.preload()
-        if input is None:
-            raise StopIteration
-        return input, target
-
-
-
-if __name__ == '__main__':
-    main()
