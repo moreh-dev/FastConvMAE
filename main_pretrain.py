@@ -29,6 +29,7 @@ import timm.optim.optim_factory as optim_factory
 
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
+from util.dali_dataloader import get_dali_dataloader
 
 import models_fastconvmae
 
@@ -146,13 +147,23 @@ def main(args):
     else:
         log_writer = None
 
-    data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=True,
-    )
+    if True:
+        data_loader_train = get_dali_dataloader(
+            batch_size = args.batch_size,
+            num_workers = args.num_workers,
+            local_rank = 0,
+            seed = seed,
+            data_dir = os.path.join(args.data_path,"train"),
+            is_training=True
+        )
+    else:
+        data_loader_train = torch.utils.data.DataLoader(
+            dataset_train, sampler=sampler_train,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_mem,
+            drop_last=True,
+        )
     
     # define the model
     model = models_fastconvmae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
@@ -188,7 +199,7 @@ def main(args):
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
-        if True:
+        if False: # True:
             data_loader_train.sampler.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, data_loader_train,
@@ -225,6 +236,7 @@ if __name__ == '__main__':
     set_backend_config('miopen_mode', 3)
     set_config('autocast_lower_precision_dtype', 'bf16')
 
+    torch.multiprocessing.set_sharing_strategy('file_system')
     args = get_args_parser()
     args = args.parse_args()
     if args.output_dir:
