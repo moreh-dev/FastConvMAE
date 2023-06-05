@@ -36,19 +36,22 @@ def train_one_epoch(model: torch.nn.Module,
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
 
-    for data_iter_step, (samples, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    data_iter_step = 0
+    # for data_iter_step, (samples, _) in metric_logger.log_every(data_loader, print_freq, header):
+    # for samples, _ in metric_logger.log_every(data_loader, print_freq, header):
+    for samples in metric_logger.log_every(data_loader, print_freq, header):
+        # print(samples.data_ptr())
         # we use a per iteration (instead of per epoch) lr scheduler
         if data_iter_step % accum_iter == 0:
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
+        samples = samples[0]["data"]
         samples = samples.to(device, non_blocking=True)
 
         with torch.cuda.amp.autocast(enabled=True):
             loss, _, _ = model(samples, mask_ratio=args.mask_ratio)
 
-        if (((data_iter_step + 1) / accum_iter) % print_freq) == 0 and not math.isfinite(loss.item()):
-            print("Loss is {}, stopping training".format(loss.item()))
-            sys.exit(1)
+
 
         loss_value = loss.detach()
 
@@ -79,7 +82,11 @@ def train_one_epoch(model: torch.nn.Module,
             log_writer.add_scalar('train_loss', loss_value, epoch_1000x)
             log_writer.add_scalar('lr', lr, epoch_1000x)
 
+        if (((data_iter_step + 1) / accum_iter) % print_freq) == 0 and not math.isfinite(loss.item()):
+            print("Loss is {}, stopping training".format(loss.item()))
+            sys.exit(1)
 
+        data_iter_step += 1
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
